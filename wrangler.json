@@ -13,8 +13,8 @@
   "durable_objects": {
     "bindings": [
       {
-        "class_name": "MyDurableObject",
-        "name": "MY_DURABLE_OBJECT"
+        "class_name": "ChatRoom",
+        "name": "CHAT_ROOM"
       }
     ]
   },

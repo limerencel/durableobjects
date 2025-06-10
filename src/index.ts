@@ -1,71 +1,176 @@
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+export class ChatRoom implements DurableObject {
+  state: DurableObjectState;
+  env: Env;
+  sessions: WebSocket[] = [];
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-  /**
-   * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-   * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-   *
-   * @param ctx - The interface for interacting with Durable Object state
-   * @param env - The interface to reference bindings declared in wrangler.jsonc
-   */
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
   }
 
-  /**
-   * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-   *  Object instance receives a request from a Worker via the same method invocation on the stub
-   *
-   * @returns The greeting to be sent back to the Worker
-   */
-  async sayHello(): Promise<string> {
-    let result = this.ctx.storage.sql
-      .exec("SELECT 'Hello, World!' as greeting")
-      .one() as { greeting: string };
-    return result.greeting;
+  async fetch(request: Request): Promise<Response> {
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (upgradeHeader != "websocket") {
+      return new Response("Expected a Websoket upgrade request", {
+        status: 426,
+      });
+    }
+
+    const [client, server] = Object.values(new WebSocketPair());
+    await this.handleSession(server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  async handleSession(webSocket: WebSocket) {
+    this.sessions.push(webSocket);
+    webSocket.accept();
+    webSocket.addEventListener("message", async (msg) => {
+      console.log(`Received message: ${msg.data}`);
+      await this.state.storage.put(`message: ${Date.now()}`, msg.data);
+      this.broadcast(msg.data as string);
+    });
+
+    webSocket.addEventListener("close", (event) => {
+      console.log(
+        `Session closed. Code: ${event.code}, Reason: ${event.reason}`
+      );
+      this.sessions = this.sessions.filter((session) => session != webSocket);
+      this.broadcast(`A user has left the room.`);
+    });
+
+    webSocket.addEventListener("error", (error) => {
+      console.error("Websoket error: ", error);
+    });
+  }
+
+  broadcast(message: string) {
+    const formattedMessage = `[${new Date().toLocaleDateString()}] ${message}`;
+    this.sessions.forEach((session) => {
+      try {
+        session.send(formattedMessage);
+      } catch (error) {
+        console.error("Failed to send messages to a session:", error);
+        this.sessions = this.sessions.filter((s) => s !== session);
+      }
+    });
   }
 }
 
 export default {
-  /**
-   * This is the standard fetch handler for a Cloudflare Worker
-   *
-   * @param request - The request submitted to the Worker from the client
-   * @param env - The interface to reference bindings declared in wrangler.jsonc
-   * @param ctx - The execution context of the Worker
-   * @returns The response to be sent back to the client
-   */
-  async fetch(request, env, ctx): Promise<Response> {
-    // Create a `DurableObjectId` for an instance of the `MyDurableObject`
-    // class. The name of class is used to identify the Durable Object.
-    // Requests from all Workers to the instance named
-    // will go to a single globally unique Durable Object instance.
-    const id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(
-      new URL(request.url).pathname,
-    );
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const url = new URL(request.url);
 
-    // Create a stub to open a communication channel with the Durable
-    // Object instance.
-    const stub = env.MY_DURABLE_OBJECT.get(id);
+    // Path 1: Root path "/"
+    if (url.pathname == "/") {
+      // Returns the HTML frontend
+      return new Response(minimalisticFrontend, {
+        headers: { "Content-type": "text/html" },
+      });
+    }
 
-    // Call the `sayHello()` RPC method on the stub to invoke the method on
-    // the remote Durable Object instance
-    const greeting = await stub.sayHello();
+    // Path 2: Websocket path "/room/..."
+    if (url.pathname.startsWith("/room/")) {
+      const roomName = url.pathname.split("/")[2];
+      if (!roomName) {
+        return new Response("Please specify a room name. e.g., /room/my-rom", {
+          status: 400,
+        });
+      }
+      // create Durable Object and stub
+      const id = env.CHAT_ROOM.idFromName(roomName);
+      const stub = env.CHAT_ROOM.get(id);
+      // forward websocket request to Durable Object
+      return stub.fetch(request);
+    }
 
-    return new Response(greeting);
+    return new Response("Not Found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+const minimalisticFrontend = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>DO Chat</title>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column; height: 95vh; }
+    #messages { flex-grow: 1; border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; overflow-y: scroll; }
+    #form { display: flex; }
+    #input { flex-grow: 1; padding: 5px; }
+    button { padding: 5px; }
+    .message { margin-bottom: 5px; }
+    .server-message { color: gray; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>Durable Object WebSocket Chat</h1>
+  <p>Room: <b id="room-name"></b></p>
+  <div id="messages"></div>
+  <form id="form" action="">
+    <input id="input" autocomplete="off" /><button>Send</button>
+  </form>
+
+  <script>
+    const messages = document.getElementById('messages');
+    const form = document.getElementById('form');
+    const input = document.getElementById('input');
+    const roomNameEl = document.getElementById('room-name');
+
+    // 让用户输入房间名
+    let roomName = prompt("Enter a room name:", "general");
+    if (!roomName) roomName = "default";
+    roomNameEl.textContent = roomName;
+
+    // 根据当前协议 (http/https) 和域名，构建 WebSocket URL (ws/wss)
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = \`\${wsProtocol}//\${window.location.host}/room/\${roomName}\`;
+    
+    const ws = new WebSocket(wsUrl);
+
+    function addMessage(content, type = 'message') {
+      const item = document.createElement('div');
+      item.className = type;
+      item.textContent = content;
+      messages.appendChild(item);
+      messages.scrollTop = messages.scrollHeight; // 自动滚动到底部
+    }
+
+    ws.onopen = (event) => {
+      addMessage('Connected to the chat room!', 'server-message');
+    };
+
+    ws.onmessage = (event) => {
+      addMessage(event.data);
+    };
+
+    ws.onclose = (event) => {
+      addMessage(\`Disconnected. Code: \${event.code}, Reason: \${event.reason}\`, 'server-message');
+    };
+
+    ws.onerror = (error) => {
+      addMessage('An error occurred!', 'server-message');
+      console.error('WebSocket Error:', error);
+    };
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (input.value) {
+        ws.send(input.value);
+        addMessage(\`You: \${input.value}\`); // 本地回显
+        input.value = '';
+      }
+    });
+  </script>
+</body>
+</html>
+`;
